@@ -49,7 +49,7 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8080
 uv run pytest tests/test_scrapers.py -s
 
 # Build Docker image locally
-docker build -t instcaper .
+docker build -t pinchana-inst .
 ```
 
 ## Runtime Architecture
