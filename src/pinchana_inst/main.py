@@ -25,6 +25,50 @@ storage = MediaStorage(
 )
 
 
+def _media_url_to_path(url: str | None):
+    if not url:
+        return None
+    url = str(url)
+    if not url.startswith("/media/"):
+        return None
+    path_part = url.split("?", 1)[0][len("/media/"):]
+    parts = path_part.split("/", 2)
+    if len(parts) < 3:
+        return None
+    platform, shortcode, filename = parts[0], parts[1], parts[2]
+    if platform != "instagram" or not shortcode or not filename:
+        return None
+    return storage.base_path / shortcode / filename
+
+
+def _cached_media_ready(metadata: dict) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    urls: list[str] = []
+    for key in ("thumbnail_url", "video_url"):
+        url = metadata.get(key)
+        if url:
+            urls.append(url)
+
+    carousel = metadata.get("carousel") or []
+    if isinstance(carousel, list):
+        for item in carousel:
+            if not isinstance(item, dict):
+                continue
+            for key in ("thumbnail_url", "video_url"):
+                url = item.get(key)
+                if url:
+                    urls.append(url)
+
+    for url in urls:
+        path = _media_url_to_path(url)
+        if not path or not path.exists():
+            return False
+
+    return True
+
+
 def extract_shortcode(url: str) -> str:
     match = re.search(r"(?:p|reels|reel|tv|share/v)/([^/?#&]+)", str(url))
     if not match:
@@ -87,8 +131,11 @@ async def process_scrape_request(request: ScrapeRequest):
     shortcode = extract_shortcode(str(request.url))
 
     if storage.is_cached(shortcode):
-        logger.info(f"Cache hit for {shortcode}")
-        return ScrapeResponse(**storage.load_metadata(shortcode))
+        cached = storage.load_metadata(shortcode)
+        if cached and _cached_media_ready(cached):
+            logger.info("Cache hit for %s", shortcode)
+            return ScrapeResponse(**cached)
+        logger.info("Cache invalid for %s, missing media; re-scraping", shortcode)
 
     logger.info(f"Scraping Instagram shortcode: {shortcode}")
     last_error = None
@@ -125,8 +172,11 @@ async def process_playwright_scrape_request(request: ScrapeRequest):
     shortcode = extract_shortcode(str(request.url))
 
     if storage.is_cached(shortcode):
-        logger.info(f"Cache hit for {shortcode}")
-        return ScrapeResponse(**storage.load_metadata(shortcode))
+        cached = storage.load_metadata(shortcode)
+        if cached and _cached_media_ready(cached):
+            logger.info("Cache hit for %s", shortcode)
+            return ScrapeResponse(**cached)
+        logger.info("Cache invalid for %s, missing media; re-scraping", shortcode)
 
     raw = await pw_scraper.scrape(str(request.url))
     if not raw:
