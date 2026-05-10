@@ -1,37 +1,28 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
+*.egg-info/
 build/
 dist/
 wheels/
-*.egg-info
 
-# Virtual environments
-.venv
+# Virtual environment
+.venv/
 
 # Environment variables
 .env
 
-# Logs and temp outputs
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Logs
 *.log
-scrape_results.*
+
+# Runtime cache (downloaded media)
+cache/
+
+# Playwright
 screenshot*.png
-screenshot*.py
-
-# Extracted data / dumps
-extracted_*
-graphql_*.json
-json_scripts_*.json
-scripts_*.txt
-
-# One-off scripts
-analyze_*.py
-check_*.py
-dump_*.py
-extract_*.py
-playwright_pattern.py
-scrape_media.py
-test_playwright.*
-
-# Docker Compose (users create their own)
-docker-compose*.yml
