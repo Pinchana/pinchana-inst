@@ -1,0 +1,160 @@
+"""Instagram scraper plugin — mounts as a FastAPI router."""
+
+import asyncio
+import os
+import re
+import logging
+from fastapi import FastAPI, APIRouter, HTTPException
+from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
+from pinchana_core.storage import MediaStorage
+from pinchana_core.vpn import GluetunController, VpnRotationError
+from pinchana_core.plugins import ScraperPlugin, registry
+from .scraper import InstagramGraphScraper, RateLimitError
+from .playwright_scraper import InstagramPlaywrightScraper
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+scraper = InstagramGraphScraper()
+pw_scraper = InstagramPlaywrightScraper()
+gluetun = GluetunController()
+storage = MediaStorage(
+    base_path=os.getenv("CACHE_PATH", "./cache"),
+    max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
+)
+
+
+def extract_shortcode(url: str) -> str:
+    match = re.search(r"(?:p|reels|reel|tv|share/v)/([^/?#&]+)", str(url))
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid Instagram URL format.")
+    return match.group(1)
+
+
+async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeResponse:
+    storage.prepare_post_dir(shortcode)
+    primary = raw["primary_media"]
+    carousel = raw.get("carousel_children")
+
+    tasks = []
+    if primary.get("display_url"):
+        tasks.append(storage.download(primary["display_url"], storage.thumbnail_path(shortcode)))
+    if primary.get("video_url"):
+        tasks.append(storage.download(primary["video_url"], storage.video_path(shortcode)))
+
+    if carousel:
+        for idx, child in enumerate(carousel):
+            if child.get("display_url"):
+                tasks.append(storage.download(child["display_url"], storage.carousel_thumbnail_path(shortcode, idx)))
+            if child.get("video_url"):
+                tasks.append(storage.download(child["video_url"], storage.carousel_video_path(shortcode, idx)))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error(f"Download error: {r}")
+
+    carousel_items = []
+    if carousel:
+        for idx, child in enumerate(carousel):
+            carousel_items.append(MediaItem(
+                index=idx,
+                media_type=child["media_type"],
+                thumbnail_url=f"/media/instagram/{shortcode}/carousel/{idx}_thumbnail.jpg",
+                video_url=f"/media/instagram/{shortcode}/carousel/{idx}_video.mp4"
+                if storage.carousel_video_path(shortcode, idx).exists() else None,
+            ))
+
+    response = ScrapeResponse(
+        shortcode=shortcode,
+        caption=raw["caption"],
+        author=raw["author"],
+        media_type=primary["media_type"],
+        thumbnail_url=f"/media/instagram/{shortcode}/thumbnail.jpg"
+        if storage.thumbnail_path(shortcode).exists() else "",
+        video_url=f"/media/instagram/{shortcode}/video.mp4"
+        if storage.video_path(shortcode).exists() else None,
+        carousel=carousel_items if carousel else None,
+    )
+
+    storage.save_metadata(shortcode, response.model_dump())
+    return response
+
+
+@router.post("/scrape", response_model=ScrapeResponse)
+async def process_scrape_request(request: ScrapeRequest):
+    shortcode = extract_shortcode(str(request.url))
+
+    if storage.is_cached(shortcode):
+        logger.info(f"Cache hit for {shortcode}")
+        return ScrapeResponse(**storage.load_metadata(shortcode))
+
+    logger.info(f"Scraping Instagram shortcode: {shortcode}")
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            raw_graph_data = await scraper.extract_media(shortcode)
+            raw = scraper.parse_response(raw_graph_data)
+            return await _download_and_build_response(shortcode, raw)
+        except RateLimitError as e:
+            last_error = e
+            logger.warning(f"Attempt {attempt} rate-limited: {e}")
+            if attempt < 3:
+                await asyncio.sleep(15)
+        except VpnRotationError as e:
+            last_error = e
+            logger.warning(f"Attempt {attempt} VPN rotation failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(30)
+        except Exception as e:
+            last_error = e
+            logger.error(f"Attempt {attempt} failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(15)
+
+    raise HTTPException(
+        status_code=503 if isinstance(last_error, RateLimitError) else 500,
+        detail=str(last_error)
+    )
+
+
+@router.post("/scrape/playwright", response_model=ScrapeResponse)
+async def process_playwright_scrape_request(request: ScrapeRequest):
+    shortcode = extract_shortcode(str(request.url))
+
+    if storage.is_cached(shortcode):
+        logger.info(f"Cache hit for {shortcode}")
+        return ScrapeResponse(**storage.load_metadata(shortcode))
+
+    raw = await pw_scraper.scrape(str(request.url))
+    if not raw:
+        raise HTTPException(status_code=500, detail="Playwright scraper failed.")
+    return await _download_and_build_response(shortcode, raw)
+
+
+@router.get("/health")
+async def health_check():
+    try:
+        status = await gluetun.get_vpn_status()
+        vpn_status = status.get("status", "").lower()
+        if vpn_status != "running":
+            raise HTTPException(status_code=503, detail=f"VPN not running: {vpn_status}")
+        return {"status": "healthy", "service": "instagram", "vpn": status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"VPN check failed: {e}")
+
+
+# Register with the global plugin registry on import.
+registry.register(ScraperPlugin(
+    name="instagram",
+    router=router,
+    route_patterns=["instagram.com", "instagr.am"],
+))
+
+# Standalone FastAPI app for container mode
+app = FastAPI(title="Pinchana Instagram", version="0.1.0")
+app.include_router(router)

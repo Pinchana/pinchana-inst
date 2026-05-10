@@ -1,10 +1,11 @@
 [project]
-name = "instcaper"
+name = "pinchana-inst"
 version = "0.1.0"
-description = "Add your description here"
+description = "Instagram scraper plugin for Pinchana"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "pinchana-core",
     "curl-cffi>=0.7.0",
     "fastapi>=0.136.1",
     "httpx>=0.27.0",
@@ -21,3 +22,10 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
 ]
+
+[tool.uv.sources]
+pinchana-core = { path = "../pinchana-core" }
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"

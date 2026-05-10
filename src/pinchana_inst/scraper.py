@@ -4,7 +4,7 @@ import urllib.parse
 import json
 import logging
 import asyncio
-from .vpn_controller import GluetunController, VpnRotationError
+from pinchana_core.vpn import GluetunController, VpnRotationError
 
 logger = logging.getLogger(__name__)
 
