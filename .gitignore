@@ -23,6 +23,7 @@ wheels/
 
 # Runtime cache (downloaded media)
 cache/
+config/
 
 # Playwright
 screenshot*.png
