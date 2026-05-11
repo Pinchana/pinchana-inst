@@ -10,14 +10,12 @@ from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 from pinchana_core.plugins import ScraperPlugin, registry
 from .scraper import InstagramGraphScraper, RateLimitError
-from .playwright_scraper import InstagramPlaywrightScraper
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 scraper = InstagramGraphScraper()
-pw_scraper = InstagramPlaywrightScraper()
 gluetun = GluetunController()
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
@@ -165,24 +163,6 @@ async def process_scrape_request(request: ScrapeRequest):
         status_code=503 if isinstance(last_error, RateLimitError) else 500,
         detail=str(last_error)
     )
-
-
-@router.post("/scrape/playwright", response_model=ScrapeResponse)
-async def process_playwright_scrape_request(request: ScrapeRequest):
-    shortcode = extract_shortcode(str(request.url))
-
-    if storage.is_cached(shortcode):
-        cached = storage.load_metadata(shortcode)
-        if cached and _cached_media_ready(cached):
-            logger.info("Cache hit for %s", shortcode)
-            return ScrapeResponse(**cached)
-        logger.info("Cache invalid for %s, missing media; re-scraping", shortcode)
-
-    raw = await pw_scraper.scrape(str(request.url))
-    if not raw:
-        raise HTTPException(status_code=500, detail="Playwright scraper failed.")
-    return await _download_and_build_response(shortcode, raw)
-
 
 @router.get("/health")
 async def health_check():
