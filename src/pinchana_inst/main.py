@@ -87,6 +87,9 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
 
     if carousel:
         for idx, child in enumerate(carousel):
+            if not isinstance(child, dict):
+                logger.warning("Skipping non-dict carousel child at index %d for %s", idx, shortcode)
+                continue
             if child.get("display_url"):
                 tasks.append(storage.download(child["display_url"], storage.carousel_thumbnail_path(shortcode, idx)))
             if child.get("video_url"):
@@ -100,9 +103,11 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
     carousel_items = []
     if carousel:
         for idx, child in enumerate(carousel):
+            if not isinstance(child, dict):
+                continue
             carousel_items.append(MediaItem(
                 index=idx,
-                media_type=child["media_type"],
+                media_type=child.get("media_type", "Unknown"),
                 thumbnail_url=f"/media/instagram/{shortcode}/carousel/{idx}_thumbnail.jpg",
                 video_url=f"/media/instagram/{shortcode}/carousel/{idx}_video.mp4"
                 if storage.carousel_video_path(shortcode, idx).exists() else None,

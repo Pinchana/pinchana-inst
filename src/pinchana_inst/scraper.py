@@ -117,8 +117,10 @@ class InstagramGraphScraper:
                 raise RateLimitError(f"HTTP {response.status_code}: retrying after rotation.")
 
             data = response.json()
+            if not isinstance(data, dict):
+                raise RateLimitError(f"Unexpected/empty JSON response from Instagram ({type(data).__name__}); treating as block.")
 
-            media = data.get('data', {}).get('xdt_shortcode_media')
+            media = (data.get('data') or {}).get('xdt_shortcode_media')
             if media is None:
                 raise ScraperError("Media not found. Post may be private or deleted.")
             return media
