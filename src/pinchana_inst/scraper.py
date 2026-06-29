@@ -4,6 +4,7 @@ import urllib.parse
 import json
 import logging
 import asyncio
+import re
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,56 @@ class InstagramGraphScraper:
         else:
             logger.warning("Failed to extract CSRF token during bootstrap.")
 
+    @staticmethod
+    def _find_media_node(obj) -> dict | None:
+        """Recursively search a JSON tree for Instagram media node keys."""
+        if isinstance(obj, dict):
+            if "xdt_shortcode_media" in obj:
+                return obj["xdt_shortcode_media"]
+            if "shortcode_media" in obj:
+                return obj["shortcode_media"]
+            for v in obj.values():
+                found = InstagramGraphScraper._find_media_node(v)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = InstagramGraphScraper._find_media_node(item)
+                if found is not None:
+                    return found
+        return None
+
+    async def _extract_from_html(self, session: AsyncSession, shortcode: str) -> dict:
+        """Fallback: fetch the post page and extract embedded JSON media node."""
+        url = f"https://www.instagram.com/p/{shortcode}/"
+        logger.info("GraphQL returned no media; trying HTML fallback for %s", shortcode)
+        try:
+            response = await session.get(url, timeout=15)
+        except Exception as e:
+            if self._is_network_timeout(e):
+                raise RateLimitError(f"Network timeout during HTML fetch: {e}")
+            raise
+
+        if response.status_code in (401, 403, 429):
+            raise RateLimitError(f"HTML fetch HTTP {response.status_code}: IP restriction detected.")
+        if response.status_code >= 400:
+            raise RateLimitError(f"HTML fetch HTTP {response.status_code}: retrying after rotation.")
+
+        html = response.text
+        # Instagram server-side renders post data inside <script type="application/json"> tags.
+        blocks = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
+        for block in blocks:
+            try:
+                data = json.loads(block)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            media = self._find_media_node(data)
+            if media is not None:
+                logger.info("Extracted media from embedded HTML JSON for %s", shortcode)
+                return media
+
+        raise ScraperError("Media not found in GraphQL response or HTML fallback.")
+
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1.5, min=4, max=30),
@@ -79,19 +130,21 @@ class InstagramGraphScraper:
         before_sleep=trigger_rotation
     )
     async def extract_media(self, shortcode: str) -> dict:
-        """Query Instagram's GraphQL API with a spoofed JA3 TLS fingerprint."""
+        """Query Instagram's GraphQL API with a spoofed JA3 TLS fingerprint.
+
+        Falls back to extracting embedded JSON from the post page HTML if the
+        GraphQL endpoint returns no media node (e.g. stale query signature or
+        soft IP block that returns 200 + null data).
+        """
         async with AsyncSession(impersonate="chrome124") as session:
             await self._bootstrap_session(session)
 
-            variables = json.dumps({
-                "shortcode": shortcode,
-                "child_comment_count": 0,
-                "fetch_comment_count": 0
-            })
-
+            # Match instaloader's exact request format for this persisted query.
+            variables = json.dumps({"shortcode": shortcode}, separators=(",", ":"))
             payload = {
+                "variables": variables,
                 "doc_id": self.DOC_ID,
-                "variables": variables
+                "server_timestamps": "true",
             }
 
             encoded_payload = urllib.parse.urlencode(payload)
@@ -100,7 +153,7 @@ class InstagramGraphScraper:
 
             try:
                 response = await session.post(
-                    "https://www.instagram.com/graphql/query/",
+                    "https://www.instagram.com/graphql/query",
                     headers=headers,
                     data=encoded_payload,
                     timeout=15
@@ -110,7 +163,7 @@ class InstagramGraphScraper:
                     raise RateLimitError(f"Network timeout, will retry: {e}")
                 raise
 
-            if response.status_code in [401, 403, 429]:
+            if response.status_code in (401, 403, 429):
                 raise RateLimitError(f"HTTP {response.status_code}: IP restriction detected.")
 
             if response.status_code >= 400:
@@ -122,7 +175,10 @@ class InstagramGraphScraper:
 
             media = (data.get('data') or {}).get('xdt_shortcode_media')
             if media is None:
-                raise ScraperError("Media not found. Post may be private or deleted.")
+                raw_preview = json.dumps(data, ensure_ascii=False)[:500]
+                logger.warning("GraphQL returned no media for %s: %s", shortcode, raw_preview)
+                media = await self._extract_from_html(session, shortcode)
+
             return media
     def parse_response(self, raw_data: dict) -> dict:
         """Transform raw GraphQL response into a plain dict."""
