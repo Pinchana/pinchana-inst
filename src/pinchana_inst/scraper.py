@@ -62,7 +62,10 @@ class InstagramGraphScraper:
             if self._is_network_timeout(e):
                 raise RateLimitError(f"Network timeout during bootstrap: {e}")
             raise
-        response.raise_for_status()
+        if response.status_code in (401, 403, 429):
+            raise RateLimitError(f"Bootstrap HTTP {response.status_code}: IP restriction detected.")
+        if response.status_code >= 400:
+            raise RateLimitError(f"Bootstrap HTTP {response.status_code}: retrying after rotation.")
         csrf_token = session.cookies.get("csrftoken")
         if csrf_token:
             self.base_headers["x-csrftoken"] = csrf_token
@@ -110,21 +113,28 @@ class InstagramGraphScraper:
             if response.status_code in [401, 403, 429]:
                 raise RateLimitError(f"HTTP {response.status_code}: IP restriction detected.")
 
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise RateLimitError(f"HTTP {response.status_code}: retrying after rotation.")
+
             data = response.json()
 
             media = data.get('data', {}).get('xdt_shortcode_media')
             if media is None:
                 raise ScraperError("Media not found. Post may be private or deleted.")
             return media
-
     def parse_response(self, raw_data: dict) -> dict:
         """Transform raw GraphQL response into a plain dict."""
         typename = raw_data.get("__typename")
 
         caption_edges = (raw_data.get("edge_media_to_caption") or {}).get("edges", [])
-        caption = caption_edges[0]["node"]["text"] if caption_edges else ""
-        author = (raw_data.get("owner") or {}).get("username", "")
+        caption = ""
+        if caption_edges:
+            node = caption_edges[0].get("node") if isinstance(caption_edges[0], dict) else None
+            if isinstance(node, dict):
+                caption = node.get("text") or ""
+
+        owner = raw_data.get("owner") or {}
+        author = owner.get("username", "") if isinstance(owner, dict) else ""
 
         primary_media = {
             "media_type": typename,
@@ -137,7 +147,11 @@ class InstagramGraphScraper:
             carousel_children = []
             edges = (raw_data.get("edge_sidecar_to_children") or {}).get("edges", [])
             for edge in edges:
-                node = edge["node"]
+                if not isinstance(edge, dict):
+                    continue
+                node = edge.get("node")
+                if not isinstance(node, dict):
+                    continue
                 carousel_children.append({
                     "media_type": node.get("__typename"),
                     "display_url": node.get("display_url"),

@@ -9,7 +9,7 @@ from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 from pinchana_core.plugins import ScraperPlugin, registry
-from .scraper import InstagramGraphScraper, RateLimitError
+from .scraper import InstagramGraphScraper, RateLimitError, ScraperError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -153,6 +153,9 @@ async def process_scrape_request(request: ScrapeRequest):
             logger.warning(f"Attempt {attempt} VPN rotation failed: {e}")
             if attempt < 3:
                 await asyncio.sleep(30)
+        except ScraperError as e:
+            logger.error(f"Permanent scraper error (not retrying): {e}")
+            raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:
             last_error = e
             logger.error(f"Attempt {attempt} failed: {e}")
