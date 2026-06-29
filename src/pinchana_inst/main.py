@@ -159,11 +159,11 @@ async def process_scrape_request(request: ScrapeRequest):
             if attempt < 3:
                 await asyncio.sleep(30)
         except ScraperError as e:
-            logger.error(f"Permanent scraper error (not retrying): {e}")
+            logger.exception(f"Permanent scraper error (not retrying): {e}")
             raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:
             last_error = e
-            logger.error(f"Attempt {attempt} failed: {e}")
+            logger.exception(f"Attempt {attempt} failed: {e}")
             if attempt < 3:
                 await asyncio.sleep(15)
 
