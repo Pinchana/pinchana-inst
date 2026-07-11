@@ -2,7 +2,9 @@ import os
 import re
 
 import pytest
+from fastapi.testclient import TestClient
 
+from pinchana_inst import main
 from pinchana_inst.scraper import InstagramGraphScraper
 
 
@@ -22,6 +24,56 @@ def get_shortcode(url):
 @pytest.fixture
 def scraper():
     return InstagramGraphScraper()
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.storage, "base_path", tmp_path)
+    return TestClient(main.app)
+
+
+def test_serves_downloaded_media(client, tmp_path):
+    media_path = tmp_path / "VID123" / "video.mp4"
+    media_path.parent.mkdir()
+    media_path.write_bytes(b"video-content")
+
+    response = client.get("/media/instagram/VID123/video.mp4")
+
+    assert response.status_code == 200
+    assert response.content == b"video-content"
+    assert response.headers["content-type"] == "video/mp4"
+
+
+def test_serves_nested_carousel_media(client, tmp_path):
+    media_path = tmp_path / "CAR123" / "carousel" / "1_video.mp4"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"carousel-content")
+
+    response = client.get("/media/instagram/CAR123/carousel/1_video.mp4")
+
+    assert response.status_code == 200
+    assert response.content == b"carousel-content"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/media/twitter/VID123/video.mp4",
+        "/media/instagram/VID123/missing.mp4",
+    ],
+)
+def test_rejects_invalid_media_requests(client, url):
+    response = client.get(url)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_rejects_media_path_traversal():
+    with pytest.raises(main.HTTPException) as exc_info:
+        await main.serve_media("instagram", "VID123", "../secret")
+
+    assert exc_info.value.status_code == 404
 
 
 def test_shortcode_to_media_id_uses_instagram_base64_alphabet(scraper):

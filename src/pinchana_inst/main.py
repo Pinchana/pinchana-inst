@@ -5,6 +5,7 @@ import os
 import re
 import logging
 from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
@@ -171,6 +172,25 @@ async def process_scrape_request(request: ScrapeRequest):
         status_code=503 if isinstance(last_error, RateLimitError) else 500,
         detail=str(last_error)
     )
+
+
+@router.get("/media/{platform}/{post_id}/{filename:path}")
+async def serve_media(platform: str, post_id: str, filename: str):
+    if platform != "instagram":
+        raise HTTPException(status_code=404, detail="Invalid platform")
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=404, detail="Invalid path")
+
+    resolved = (storage.base_path / post_id / filename).resolve()
+    base_resolved = storage.base_path.resolve()
+    if not resolved.is_relative_to(base_resolved):
+        raise HTTPException(status_code=404, detail="Invalid path")
+
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(resolved)
+
 
 @router.get("/health")
 async def health_check():
