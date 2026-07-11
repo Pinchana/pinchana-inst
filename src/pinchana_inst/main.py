@@ -130,8 +130,7 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
     return response
 
 
-@router.post("/scrape", response_model=ScrapeResponse)
-async def process_scrape_request(request: ScrapeRequest):
+async def _process_scrape_request(request: ScrapeRequest):
     shortcode = extract_shortcode(str(request.url))
 
     if storage.is_cached(shortcode):
@@ -174,6 +173,12 @@ async def process_scrape_request(request: ScrapeRequest):
     )
 
 
+@router.post("/scrape", response_model=ScrapeResponse)
+async def process_scrape_request(request: ScrapeRequest):
+    shortcode = extract_shortcode(str(request.url))
+    return await storage.singleflight(shortcode, lambda: _process_scrape_request(request))
+
+
 @router.get("/media/{platform}/{post_id}/{filename:path}")
 async def serve_media(platform: str, post_id: str, filename: str):
     if platform != "instagram":
@@ -197,7 +202,7 @@ async def health_check():
     try:
         status = await gluetun.get_vpn_status()
         vpn_status = status.get("status", "").lower()
-        if vpn_status != "running":
+        if gluetun.enabled and vpn_status != "running":
             raise HTTPException(status_code=503, detail=f"VPN not running: {vpn_status}")
         return {"status": "healthy", "service": "instagram", "vpn": status}
     except HTTPException:
@@ -216,3 +221,8 @@ registry.register(ScraperPlugin(
 # Standalone FastAPI app for container mode
 app = FastAPI(title="Pinchana Instagram", version="0.1.0")
 app.include_router(router)
+
+
+@app.on_event("shutdown")
+async def close_storage_client():
+    await storage.close()
