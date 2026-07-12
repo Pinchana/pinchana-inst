@@ -1,5 +1,5 @@
 from curl_cffi.requests import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential
 import json
 import logging
 import re
