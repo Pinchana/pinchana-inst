@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import urllib.parse
+import os
 
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
