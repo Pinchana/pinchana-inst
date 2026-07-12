@@ -26,11 +26,25 @@ gluetun = GluetunController()
 async def trigger_rotation(retry_state):
     """Trigger VPN IP rotation before each retry."""
     logger.warning(f"Retry attempt {retry_state.attempt_number}. Rotating VPN IP...")
+    if retry_state.args:
+        scraper_inst = retry_state.args[0]
+        if hasattr(scraper_inst, "clear_bootstrap_cache"):
+            scraper_inst.clear_bootstrap_cache()
+            logger.info("Cleared Instagram scraper bootstrap cache.")
     try:
         await gluetun.rotate_ip()
     except VpnRotationError as e:
         logger.warning(f"VPN rotation failed: {e}")
         raise RateLimitError(str(e))
+
+
+def _should_retry_rate_limit(retry_state):
+    """Only retry rate limits if VPN rotation is enabled."""
+    vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not vpn_enabled:
+        return False
+    exception = retry_state.outcome.exception()
+    return isinstance(exception, RateLimitError)
 
 
 class InstagramGraphScraper:
@@ -55,6 +69,12 @@ class InstagramGraphScraper:
             "Origin": "https://www.instagram.com",
             "Referer": "https://www.instagram.com/",
         }
+        self._bootstrap_cache = None
+        self._cookie_cache = None
+
+    def clear_bootstrap_cache(self):
+        self._bootstrap_cache = None
+        self._cookie_cache = None
 
     def _is_network_timeout(self, e: Exception) -> bool:
         """Check if an exception is a network timeout that should trigger retry."""
@@ -63,6 +83,11 @@ class InstagramGraphScraper:
 
     async def _bootstrap_session(self, session: AsyncSession) -> dict[str, str]:
         """Harvest CSRF, LSD, and tracking cookies from Instagram's homepage."""
+        if self._bootstrap_cache and self._cookie_cache:
+            for k, v in self._cookie_cache.items():
+                session.cookies.set(k, v)
+            return self._bootstrap_cache
+
         try:
             response = await session.get("https://www.instagram.com/", timeout=15)
         except Exception as e:
@@ -83,7 +108,9 @@ class InstagramGraphScraper:
         if not lsd_token:
             raise RateLimitError("Bootstrap did not return an LSD token; treating as a soft block.")
 
-        return {"csrf_token": csrf_token, "lsd_token": lsd_token}
+        self._bootstrap_cache = {"csrf_token": csrf_token, "lsd_token": lsd_token}
+        self._cookie_cache = {k: v for k, v in session.cookies.items()}
+        return self._bootstrap_cache
 
     @classmethod
     def _shortcode_to_media_id(cls, shortcode: str) -> str:
@@ -428,7 +455,7 @@ class InstagramGraphScraper:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1.5, min=4, max=30),
-        retry=retry_if_exception_type(RateLimitError),
+        retry=_should_retry_rate_limit,
         before_sleep=trigger_rotation,
     )
     async def extract_media(self, shortcode: str) -> dict:

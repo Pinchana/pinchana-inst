@@ -151,21 +151,27 @@ async def _process_scrape_request(request: ScrapeRequest):
         except RateLimitError as e:
             last_error = e
             logger.warning(f"Attempt {attempt} rate-limited: {e}")
-            if attempt < 3:
-                await asyncio.sleep(15)
+            vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
+            if not vpn_enabled or attempt >= 3:
+                break
+            await asyncio.sleep(1)
         except VpnRotationError as e:
             last_error = e
             logger.warning(f"Attempt {attempt} VPN rotation failed: {e}")
-            if attempt < 3:
-                await asyncio.sleep(30)
+            vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
+            if not vpn_enabled or attempt >= 3:
+                break
+            await asyncio.sleep(1)
         except ScraperError as e:
             logger.exception(f"Permanent scraper error (not retrying): {e}")
             raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:
             last_error = e
             logger.exception(f"Attempt {attempt} failed: {e}")
-            if attempt < 3:
-                await asyncio.sleep(15)
+            vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
+            if not vpn_enabled or attempt >= 3:
+                break
+            await asyncio.sleep(1)
 
     raise HTTPException(
         status_code=503 if isinstance(last_error, RateLimitError) else 500,
