@@ -84,10 +84,12 @@ class InstagramGraphScraper:
 
     async def _bootstrap_session(self, session: AsyncSession) -> dict[str, str]:
         """Harvest CSRF, LSD, and tracking cookies from Instagram's homepage."""
-        if self._bootstrap_cache and self._cookie_cache:
-            for k, v in self._cookie_cache.items():
+        bootstrap = self._bootstrap_cache
+        cookies = self._cookie_cache
+        if bootstrap and cookies:
+            for k, v in cookies.items():
                 session.cookies.set(k, v)
-            return self._bootstrap_cache
+            return bootstrap
 
         try:
             response = await session.get("https://www.instagram.com/", timeout=15)
