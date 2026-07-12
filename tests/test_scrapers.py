@@ -1,11 +1,13 @@
 import os
 import re
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pinchana_inst import main
-from pinchana_inst.scraper import InstagramGraphScraper
+import pinchana_inst.scraper as scraper_module
+from pinchana_inst.scraper import InstagramGraphScraper, RateLimitError, _should_retry_rate_limit
 
 
 TEST_URLS = [
@@ -76,6 +78,33 @@ async def test_rejects_media_path_traversal():
     assert exc_info.value.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_process_scrape_request_fails_fast_when_vpn_disabled(monkeypatch):
+    attempts = 0
+    sleep_calls = 0
+
+    async def fake_extract_media(_shortcode):
+        nonlocal attempts
+        attempts += 1
+        raise RateLimitError("blocked")
+
+    async def fake_sleep(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+
+    monkeypatch.setenv("VPN_ENABLED", "0")
+    monkeypatch.setattr(main.scraper, "extract_media", fake_extract_media)
+    monkeypatch.setattr(main.storage, "is_cached", lambda _shortcode: False)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        await main._process_scrape_request(SimpleNamespace(url="https://www.instagram.com/p/ABC123/"))
+
+    assert exc_info.value.status_code == 503
+    assert attempts == 1
+    assert sleep_calls == 0
+
+
 def test_shortcode_to_media_id_uses_instagram_base64_alphabet(scraper):
     assert scraper._shortcode_to_media_id("A") == "0"
     assert scraper._shortcode_to_media_id("B") == "1"
@@ -98,6 +127,39 @@ def test_graphql_execution_error_classification(scraper):
 
     assert scraper._is_graphql_execution_error(payload) is True
     assert scraper._is_graphql_execution_error({"errors": [{"message": "not found"}]}) is False
+
+
+def test_should_retry_rate_limit_disabled_when_vpn_disabled(monkeypatch):
+    class Outcome:
+        @staticmethod
+        def exception():
+            return RateLimitError("blocked")
+
+    monkeypatch.setenv("VPN_ENABLED", "0")
+    retry_state = SimpleNamespace(outcome=Outcome())
+
+    assert _should_retry_rate_limit(retry_state) is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_rotation_clears_bootstrap_cache(monkeypatch, scraper):
+    scraper._bootstrap_cache = {"csrf_token": "csrf", "lsd_token": "lsd"}
+    scraper._cookie_cache = {"csrftoken": "cookie"}
+
+    rotated = False
+
+    async def fake_rotate_ip():
+        nonlocal rotated
+        rotated = True
+
+    monkeypatch.setattr(scraper_module.gluetun, "rotate_ip", fake_rotate_ip)
+
+    retry_state = SimpleNamespace(attempt_number=1, args=(scraper,))
+    await scraper_module.trigger_rotation(retry_state)
+
+    assert rotated is True
+    assert scraper._bootstrap_cache is None
+    assert scraper._cookie_cache is None
 
 
 def test_normalizes_logged_out_image_payload(scraper):
