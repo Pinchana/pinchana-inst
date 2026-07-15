@@ -10,7 +10,13 @@ from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 from pinchana_core.plugins import ScraperPlugin, registry
-from .scraper import InstagramGraphScraper, RateLimitError, ScraperError
+from .scraper import (
+    InstagramGraphScraper,
+    MediaNotFoundError,
+    RateLimitError,
+    RestrictedMediaError,
+    ScraperError,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -141,42 +147,69 @@ async def _process_scrape_request(request: ScrapeRequest):
         logger.info("Cache invalid for %s, missing media; re-scraping", shortcode)
 
     logger.info(f"Scraping Instagram shortcode: {shortcode}")
-    last_error = None
-
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             raw_graph_data = await scraper.extract_media(shortcode)
             raw = scraper.parse_response(raw_graph_data)
             return await _download_and_build_response(shortcode, raw)
         except RateLimitError as e:
-            last_error = e
-            logger.warning(f"Attempt {attempt} rate-limited: {e}")
+            logger.warning("Attempt %d rate-limited for %s: %s", attempt, shortcode, e)
             vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
-            if not vpn_enabled or attempt >= 3:
-                break
-            await asyncio.sleep(15)
+            if not vpn_enabled or attempt >= 2:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "rate_limited",
+                        "message": "Instagram is temporarily rate limited",
+                    },
+                ) from e
+            scraper.clear_bootstrap_cache()
+            logger.info("Cleared Instagram bootstrap cache before the single retry.")
+            try:
+                await gluetun.rotate_ip()
+            except VpnRotationError as rotation_error:
+                logger.warning("Instagram VPN rotation failed: %s", rotation_error)
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "rate_limited",
+                        "message": "Instagram is temporarily rate limited",
+                    },
+                ) from rotation_error
         except VpnRotationError as e:
-            last_error = e
-            logger.warning(f"Attempt {attempt} VPN rotation failed: {e}")
-            vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
-            if not vpn_enabled or attempt >= 3:
-                break
-            await asyncio.sleep(30)
+            logger.warning("Instagram VPN rotation failed: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "rate_limited", "message": "Instagram is temporarily rate limited"},
+            ) from e
+        except RestrictedMediaError as e:
+            logger.info("Instagram post %s is not accessible anonymously: %s", shortcode, e)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "restricted_media",
+                    "message": "This Instagram post is not accessible anonymously",
+                },
+            ) from e
+        except MediaNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "not_found", "message": "Instagram post not found"},
+            ) from e
         except ScraperError as e:
-            logger.exception(f"Permanent scraper error (not retrying): {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.exception("Instagram extraction failed for %s: %s", shortcode, e)
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "extraction_failed", "message": "Instagram extraction failed"},
+            ) from e
         except Exception as e:
-            last_error = e
-            logger.exception(f"Attempt {attempt} failed: {e}")
-            vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
-            if not vpn_enabled or attempt >= 3:
-                break
-            await asyncio.sleep(15)
+            logger.exception("Unexpected Instagram extraction failure for %s: %s", shortcode, e)
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "extraction_failed", "message": "Instagram extraction failed"},
+            ) from e
 
-    raise HTTPException(
-        status_code=503 if isinstance(last_error, RateLimitError) else 500,
-        detail=str(last_error)
-    )
+    raise RuntimeError("unreachable")
 
 
 @router.post("/scrape", response_model=ScrapeResponse)

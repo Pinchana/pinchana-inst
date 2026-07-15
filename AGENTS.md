@@ -16,7 +16,7 @@ Two scraping strategies are implemented:
 - **HTTP Clients:** `curl-cffi` (scraper), `httpx` (storage downloads + VPN controller)
 - **Browser Automation:** Playwright + `playwright-stealth`
 - **Validation:** Pydantic v2
-- **Retry Logic:** `tenacity`
+- **Retry Logic:** bounded endpoint retry with one optional VPN rotation
 - **VPN Orchestration:** Gluetun control API
 - **Container:** Docker (python:3.13-slim base)
 - **CI/CD:** GitHub Actions → GHCR
@@ -56,9 +56,7 @@ docker build -t pinchana-inst .
 
 The scraper container is designed to run inside Gluetun's network namespace (`network_mode: "service:gluetun"`). All outbound traffic is therefore tunneled through NordVPN (or another provider configured in Gluetun).
 
-When the GraphQL scraper receives a 403/429 or hits a network timeout, it raises `RateLimitError`. The `@retry` decorator from `tenacity` triggers `trigger_rotation`, which calls `GluetunController.rotate_ip()`. The VPN tunnel is torn down and rebuilt; the controller polls Gluetun until the tunnel reports `connected` before resuming.
-
-At the FastAPI endpoint level (`POST /scrape`), there is a second layer of retry (3 attempts) with sleeps (15–30s) to handle cases where the VPN is actively restarting.
+When the GraphQL scraper receives a definite 401/403/429 block or network timeout, it raises `RateLimitError`. The FastAPI endpoint owns the complete retry policy: it clears bootstrap state, rotates through `GluetunController.rotate_ip()`, and retries exactly once. Anonymous GraphQL responses that contain no media continue through the remaining GraphQL and HTML fallbacks without rotating the VPN.
 
 ### API Endpoints
 
@@ -106,7 +104,7 @@ The `/scrape` endpoints check `storage.is_cached(shortcode)` first and return th
 - **Async first:** All I/O-bound operations use `async`/`await`.
 - **Type hints:** Used consistently across modules.
 - **Logging:** Standard `logging` module; `logger = logging.getLogger(__name__)` pattern in every module.
-- **Exceptions:** Custom hierarchies (`ScraperError` → `RateLimitError`; `VpnRotationError`) to distinguish retryable vs fatal errors.
+- **Exceptions:** Custom hierarchies (`ScraperError` → `RateLimitError`, `RestrictedMediaError`, `MediaNotFoundError`; `VpnRotationError`) distinguish retryable network blocks from post-specific restrictions and fatal extraction errors.
 - **Pydantic models:** All API request/response contracts are modeled (`ScrapeRequest`, `ScrapeResponse`, `MediaItem`).
 - **Path safety:** The media-serving route resolves paths and validates they stay inside `base_path` to prevent directory traversal.
 - **Constants:** Volatile Instagram API parameters (e.g., `DOC_ID`, `x-ig-app-id`) are declared as class attributes near the top of the scraper for easy updates.
@@ -126,7 +124,7 @@ The `/scrape` endpoints check `storage.is_cached(shortcode)` first and return th
 
 ## Important Implementation Notes
 
-- The GraphQL scraper's `extract_media` is decorated with `@retry(stop=stop_after_attempt(5), …, before_sleep=trigger_rotation)`. Each retry attempt rotates the VPN IP via Gluetun before sleeping with exponential backoff.
+- `extract_media` has no retry decorator. `_process_scrape_request` is the single retry owner and permits two total extraction attempts with at most one VPN rotation.
 - `GluetunController.rotate_ip()` enforces a 90-second cooldown (`ROTATION_COOLDOWN`) between rotations to avoid flapping.
 - Playwright scraping blocks non-essential resources (images, fonts, stylesheets, analytics scripts) to reduce fingerprint and speed up loading.
 - Playwright uses four fallback strategies in order: intercepted GraphQL response → embedded JSON in `<script type="application/json">` tags → DOM extraction → Open Graph meta tags.

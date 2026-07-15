@@ -1,12 +1,8 @@
 from curl_cffi.requests import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential
 import json
 import logging
 import re
 import urllib.parse
-import os
-
-from pinchana_core.vpn import GluetunController, VpnRotationError
 
 logger = logging.getLogger(__name__)
 
@@ -21,31 +17,14 @@ class RateLimitError(ScraperError):
     pass
 
 
-gluetun = GluetunController()
+class RestrictedMediaError(ScraperError):
+    """The post is not accessible through Instagram's anonymous surfaces."""
+    pass
 
 
-async def trigger_rotation(retry_state):
-    """Trigger VPN IP rotation before each retry."""
-    logger.warning(f"Retry attempt {retry_state.attempt_number}. Rotating VPN IP...")
-    if retry_state.args:
-        scraper_inst = retry_state.args[0]
-        if hasattr(scraper_inst, "clear_bootstrap_cache"):
-            scraper_inst.clear_bootstrap_cache()
-            logger.info("Cleared Instagram scraper bootstrap cache.")
-    try:
-        await gluetun.rotate_ip()
-    except VpnRotationError as e:
-        logger.warning(f"VPN rotation failed: {e}")
-        raise RateLimitError(str(e))
-
-
-def _should_retry_rate_limit(retry_state):
-    """Only retry rate limits if VPN rotation is enabled."""
-    vpn_enabled = os.getenv("VPN_ENABLED", "true").lower() in ("1", "true", "yes")
-    if not vpn_enabled:
-        return False
-    exception = retry_state.outcome.exception()
-    return isinstance(exception, RateLimitError)
+class MediaNotFoundError(ScraperError):
+    """The post was removed or does not exist."""
+    pass
 
 
 class InstagramGraphScraper:
@@ -101,7 +80,7 @@ class InstagramGraphScraper:
         if response.status_code in (401, 403, 429):
             raise RateLimitError(f"Bootstrap HTTP {response.status_code}: IP restriction detected.")
         if response.status_code >= 400:
-            raise RateLimitError(f"Bootstrap HTTP {response.status_code}: retrying after rotation.")
+            raise ScraperError(f"Bootstrap HTTP {response.status_code}.")
 
         csrf_token = session.cookies.get("csrftoken") or self._extract_csrf_token(response.text)
         if not csrf_token:
@@ -317,14 +296,14 @@ class InstagramGraphScraper:
         if response.status_code in (401, 403, 429):
             raise RateLimitError(f"{context} HTTP {response.status_code}: IP restriction detected.")
         if response.status_code >= 400:
-            raise RateLimitError(f"{context} HTTP {response.status_code}: retrying after rotation.")
+            raise ScraperError(f"{context} HTTP {response.status_code}.")
         try:
             data = response.json()
         except Exception as e:
-            raise RateLimitError(f"{context} returned invalid JSON; treating as a soft block: {e}") from e
+            raise ScraperError(f"{context} returned invalid JSON: {e}") from e
         if not isinstance(data, dict):
-            raise RateLimitError(
-                f"{context} returned {type(data).__name__} instead of JSON object; treating as a soft block."
+            raise ScraperError(
+                f"{context} returned {type(data).__name__} instead of a JSON object."
             )
         return data
 
@@ -339,7 +318,7 @@ class InstagramGraphScraper:
         session: AsyncSession,
         shortcode: str,
         bootstrap: dict[str, str],
-    ) -> dict:
+    ) -> dict | None:
         media_id = self._shortcode_to_media_id(shortcode)
         payload = {
             "av": "0",
@@ -378,12 +357,8 @@ class InstagramGraphScraper:
             return media
 
         raw_preview = json.dumps(data, ensure_ascii=False)[:500]
-        if self._is_graphql_execution_error(data):
-            raise RateLimitError(f"Logged-out GraphQL execution error for {shortcode}: {raw_preview}")
-        if data.get("data") is None and data.get("status") == "ok":
-            raise RateLimitError(f"Logged-out GraphQL returned empty data for {shortcode}: {raw_preview}")
-
-        raise ScraperError(f"Logged-out GraphQL did not include public media for {shortcode}.")
+        logger.warning("Logged-out GraphQL returned no public media for %s: %s", shortcode, raw_preview)
+        return None
 
     async def _extract_legacy_shortcode(
         self,
@@ -419,8 +394,6 @@ class InstagramGraphScraper:
 
         raw_preview = json.dumps(data, ensure_ascii=False)[:500]
         logger.warning("Legacy GraphQL returned no media for %s: %s", shortcode, raw_preview)
-        if self._is_graphql_execution_error(data) or (data.get("data") is None and data.get("status") == "ok"):
-            raise RateLimitError(f"Legacy GraphQL returned a soft-block response for {shortcode}: {raw_preview}")
         return None
 
     async def _extract_from_html(self, session: AsyncSession, shortcode: str) -> dict:
@@ -436,8 +409,10 @@ class InstagramGraphScraper:
 
         if response.status_code in (401, 403, 429):
             raise RateLimitError(f"HTML fetch HTTP {response.status_code}: IP restriction detected.")
+        if response.status_code == 404:
+            raise MediaNotFoundError(f"Instagram post {shortcode} was not found.")
         if response.status_code >= 400:
-            raise RateLimitError(f"HTML fetch HTTP {response.status_code}: retrying after rotation.")
+            raise ScraperError(f"HTML fetch HTTP {response.status_code}.")
 
         blocks = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', response.text, re.DOTALL)
         for block in blocks:
@@ -450,24 +425,19 @@ class InstagramGraphScraper:
                 logger.info("Extracted media from embedded HTML JSON for %s", shortcode)
                 return media
 
-        raise ScraperError(
-            "Media not found in Instagram anonymous GraphQL responses or HTML fallback. "
-            "The post may be private, login-gated, region-gated, or blocked by IP reputation."
+        raise RestrictedMediaError(
+            f"Instagram post {shortcode} is not accessible anonymously."
         )
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1.5, min=4, max=30),
-        retry=_should_retry_rate_limit,
-        before_sleep=trigger_rotation,
-    )
     async def extract_media(self, shortcode: str) -> dict:
         """Query Instagram public media using anonymous web endpoints."""
         async with AsyncSession(impersonate="chrome124") as session:
             bootstrap = await self._bootstrap_session(session)
 
             try:
-                return await self._extract_polaris_logged_out(session, shortcode, bootstrap)
+                logged_out = await self._extract_polaris_logged_out(session, shortcode, bootstrap)
+                if logged_out is not None:
+                    return logged_out
             except RateLimitError:
                 raise
             except ScraperError as e:
@@ -479,6 +449,8 @@ class InstagramGraphScraper:
                     return legacy
             except RateLimitError:
                 raise
+            except ScraperError as e:
+                logger.warning("Legacy GraphQL failed for %s: %s", shortcode, e)
 
             return await self._extract_from_html(session, shortcode)
 
