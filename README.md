@@ -1,63 +1,45 @@
-# 📸 Pinchana Instagram Scraper
+# Pinchana Instagram
 
-**Pinchana Instagram Scraper** is a high-performance module for extracting media from Instagram using a GraphQL-only strategy backed by VPN rotation and resilient retries.
+This FastAPI module extracts public Instagram posts, Reels, and compatible video posts through an HTTP GraphQL workflow. It downloads images, videos, and ordered carousels into the shared Pinchana cache.
 
----
+## Processing flow
 
-## ✨ Key Features
+1. Validate and normalize the submitted Instagram URL.
+2. Extract post data through Instagram GraphQL using the configured HTTP impersonation.
+3. Rotate the Gluetun connection and retry within the bounded policy after relevant `403` or `429` responses.
+4. Download media and store it under `/app/cache/instagram/{shortcode}` in containers.
 
-- **🚀 GraphQL-Only Scraping:** High-speed direct queries to Instagram's internal API using `curl-cffi` with JA3/TLS fingerprint impersonation.
-- **🔄 Smart VPN Rotation:** Automatically detects rate limits (403/429) and signals the VPN (Gluetun) to rotate IPs.
-- **💾 Local Caching:** Saves downloaded images, videos, and carousels to a persistent LRU cache.
-- **🌐 Standalone Service:** Operates as a FastAPI service that can be easily integrated into the Pinchana Gateway.
+Private, deleted, login-only, region-restricted, or changed posts can return a structured rejection even when the service is healthy.
 
----
+## API
 
-## 🏗 Architecture
+- `POST /scrape` accepts `{"url":"https://www.instagram.com/p/SHORTCODE/"}`.
+- `GET /health` reports module and VPN readiness.
 
-The scraper follows an "Extract -> Download -> Cache" workflow:
-1. **Extraction:** Uses Instagram GraphQL with robust retry and anti-block handling.
-2. **Download:** Media is downloaded through the secure VPN tunnel.
-3. **Storage:** Files are organized under `/app/cache/instagram/{shortcode}`.
+External clients should use the gateway's authenticated `POST /v1/scrape` route.
 
----
+## Configuration
 
-## 📡 API Reference
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CACHE_PATH` | `./cache` | Base media cache path |
+| `CACHE_MAX_SIZE_GB` | `10.0` | Maximum cache size before oldest-post eviction |
+| `GLUETUN_CONTROL_URL` | `http://localhost:8000` | Private Gluetun control endpoint |
 
-### `POST /scrape`
-Extracts and downloads media for a given Instagram URL (Posts, Reels, TV).
-```json
-{
-  "url": "https://www.instagram.com/p/C6_abcdefg/"
-}
+## Development and validation
+
+```sh
+uv sync --frozen
+uv run uvicorn pinchana_inst.main:app --host 0.0.0.0 --port 8082 --reload
 ```
 
-### `GET /health`
-Checks service health, VPN connectivity, and scraper status.
-
----
-
-## ⚙️ Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CACHE_PATH` | `./cache` | Base path for media storage. |
-| `CACHE_MAX_SIZE_GB` | `10.0` | Max size for the LRU cache. |
-| `GLUETUN_CONTROL_URL` | `http://localhost:8000` | URL for the Gluetun control API. |
-
----
-
-## 🛠 Development
-
-Managed by `uv`.
-
-```bash
-uv sync
-uv run uvicorn src.pinchana_inst.main:app --host 0.0.0.0 --port 8082
+```sh
+uv run pytest -q
+PINCHANA_INST_LIVE=1 uv run pytest -q
 ```
 
----
+Live tests contact Instagram and are opt-in. Build the image from the parent repository so `pinchana-core` is available:
 
-## 📜 License
-
-MIT
+```sh
+docker build --file pinchana-inst/Dockerfile --tag pinchana-inst:local .
+```
