@@ -1,16 +1,19 @@
 """Instagram scraper plugin — mounts as a FastAPI router."""
 
 import asyncio
+import logging
 import os
 import re
-import logging
-from fastapi import FastAPI, APIRouter, HTTPException
+
+from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pinchana_core.models import ScrapeRequest, ScrapeResponse, MediaItem
+from pinchana_core.models import MediaItem, ScrapeRequest, ScrapeResponse
+from pinchana_core.plugins import ScraperPlugin, registry
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
-from pinchana_core.plugins import ScraperPlugin, registry
+
 from .scraper import (
+    AnonymousMediaUnavailableError,
     InstagramGraphScraper,
     MediaNotFoundError,
     RateLimitError,
@@ -28,6 +31,7 @@ storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
+INSTAGRAM_CACHE_VERSION = 2
 
 
 def _media_url_to_path(url: str | None):
@@ -49,6 +53,8 @@ def _media_url_to_path(url: str | None):
 def _cached_media_ready(metadata: dict) -> bool:
     if not isinstance(metadata, dict):
         return False
+    if metadata.get("_cache_version") != INSTAGRAM_CACHE_VERSION:
+        return False
 
     urls: list[str] = []
     for key in ("thumbnail_url", "video_url"):
@@ -66,9 +72,11 @@ def _cached_media_ready(metadata: dict) -> bool:
                 if url:
                     urls.append(url)
 
+    if not urls:
+        return False
     for url in urls:
         path = _media_url_to_path(url)
-        if not path or not path.exists():
+        if not path or not path.is_file() or path.stat().st_size <= 0:
             return False
 
     return True
@@ -88,9 +96,21 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
 
     tasks = []
     if primary.get("display_url"):
-        tasks.append(storage.download(primary["display_url"], storage.thumbnail_path(shortcode)))
+        destination = storage.thumbnail_path(shortcode)
+        tasks.append((
+            storage.download(primary["display_url"], destination),
+            not bool(primary.get("video_url")) and not carousel,
+            "primary image",
+            destination,
+        ))
     if primary.get("video_url"):
-        tasks.append(storage.download(primary["video_url"], storage.video_path(shortcode)))
+        destination = storage.video_path(shortcode)
+        tasks.append((
+            storage.download(primary["video_url"], destination),
+            True,
+            "primary video",
+            destination,
+        ))
 
     if carousel:
         for idx, child in enumerate(carousel):
@@ -98,14 +118,46 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
                 logger.warning("Skipping non-dict carousel child at index %d for %s", idx, shortcode)
                 continue
             if child.get("display_url"):
-                tasks.append(storage.download(child["display_url"], storage.carousel_thumbnail_path(shortcode, idx)))
+                destination = storage.carousel_thumbnail_path(shortcode, idx)
+                tasks.append((
+                    storage.download(child["display_url"], destination),
+                    not bool(child.get("video_url")),
+                    f"carousel item {idx} image",
+                    destination,
+                ))
             if child.get("video_url"):
-                tasks.append(storage.download(child["video_url"], storage.carousel_video_path(shortcode, idx)))
+                destination = storage.carousel_video_path(shortcode, idx)
+                tasks.append((
+                    storage.download(child["video_url"], destination),
+                    True,
+                    f"carousel item {idx} video",
+                    destination,
+                ))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception):
-            logger.error(f"Download error: {r}")
+    results = await asyncio.gather(
+        *(task for task, _, _, _ in tasks),
+        return_exceptions=True,
+    )
+    failed_required = [
+        label
+        for (_, required, label, destination), result in zip(tasks, results)
+        if required
+        and (
+            isinstance(result, Exception)
+            or result is not True
+            or not destination.is_file()
+            or destination.stat().st_size <= 0
+        )
+    ]
+    if failed_required:
+        logger.error("Required Instagram downloads failed for %s: %s", shortcode, failed_required)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "media_download_failed",
+                "message": "Instagram media download failed",
+            },
+        )
 
     carousel_items = []
     if carousel:
@@ -115,7 +167,11 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
             carousel_items.append(MediaItem(
                 index=idx,
                 media_type=child.get("media_type", "Unknown"),
-                thumbnail_url=f"/media/instagram/{shortcode}/carousel/{idx}_thumbnail.jpg",
+                thumbnail_url=(
+                    f"/media/instagram/{shortcode}/carousel/{idx}_thumbnail.jpg"
+                    if storage.carousel_thumbnail_path(shortcode, idx).exists()
+                    else ""
+                ),
                 video_url=f"/media/instagram/{shortcode}/carousel/{idx}_video.mp4"
                 if storage.carousel_video_path(shortcode, idx).exists() else None,
             ))
@@ -132,7 +188,9 @@ async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeRespo
         carousel=carousel_items if carousel else None,
     )
 
-    storage.save_metadata(shortcode, response.model_dump())
+    metadata = response.model_dump()
+    metadata["_cache_version"] = INSTAGRAM_CACHE_VERSION
+    storage.save_metadata(shortcode, metadata)
     return response
 
 
@@ -163,8 +221,6 @@ async def _process_scrape_request(request: ScrapeRequest):
                         "message": "Instagram is temporarily rate limited",
                     },
                 ) from e
-            scraper.clear_bootstrap_cache()
-            logger.info("Cleared Instagram bootstrap cache before the single retry.")
             try:
                 await gluetun.rotate_ip()
             except VpnRotationError as rotation_error:
@@ -191,11 +247,22 @@ async def _process_scrape_request(request: ScrapeRequest):
                     "message": "This Instagram post is not accessible anonymously",
                 },
             ) from e
+        except AnonymousMediaUnavailableError as e:
+            logger.info("Instagram post %s is unavailable anonymously: %s", shortcode, e)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "anonymous_unavailable",
+                    "message": "Instagram returned no public media for this post",
+                },
+            ) from e
         except MediaNotFoundError as e:
             raise HTTPException(
                 status_code=404,
                 detail={"code": "not_found", "message": "Instagram post not found"},
             ) from e
+        except HTTPException:
+            raise
         except ScraperError as e:
             logger.exception("Instagram extraction failed for %s: %s", shortcode, e)
             raise HTTPException(

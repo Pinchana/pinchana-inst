@@ -1,8 +1,10 @@
-from curl_cffi.requests import AsyncSession
 import json
 import logging
 import re
 import urllib.parse
+from html import unescape
+
+from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,12 @@ class RateLimitError(ScraperError):
 
 
 class RestrictedMediaError(ScraperError):
-    """The post is not accessible through Instagram's anonymous surfaces."""
+    """Instagram explicitly marked the post as restricted."""
+    pass
+
+
+class AnonymousMediaUnavailableError(ScraperError):
+    """Anonymous first-party surfaces returned no media and no decisive reason."""
     pass
 
 
@@ -28,71 +35,36 @@ class MediaNotFoundError(ScraperError):
 
 
 class InstagramGraphScraper:
-    # Volatile web API parameters; keep them grouped for quick updates.
-    LEGACY_SHORTCODE_DOC_ID = "8845758582119845"
-    POLARIS_LOGGED_OUT_DOC_ID = "27130156389949648"
     POLARIS_FRIENDLY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery"
     SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    MAX_RELAY_BUNDLES = 40
+    MAX_RELAY_BUNDLE_BYTES = 8_000_000
+    SCRIPT_SRC_RE = re.compile(r'<script\b[^>]*\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
+    OPERATION_MODULE_RE = re.compile(
+        r'__d\("(?P<name>[A-Za-z0-9_$]+(?:Query|Mutation))_instagramRelayOperation"'
+        r'.{0,600}?\.exports="(?P<doc_id>\d{12,})"',
+        re.DOTALL,
+    )
+    DIRECT_OPERATION_RE = re.compile(
+        r'params:\{id:"(?P<doc_id>\d{12,})".{0,600}?'
+        r'name:"(?P<name>[A-Za-z0-9_$]+(?:Query|Mutation))"',
+        re.DOTALL,
+    )
 
-    def __init__(self):
+    def __init__(self, session_factory=AsyncSession):
+        self._session_factory = session_factory
         self.base_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
-            "x-ig-app-id": "936619743392459",
-            "x-asbd-id": "129477",
-            "x-ig-www-claim": "0",
-            "x-requested-with": "XMLHttpRequest",
-            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://www.instagram.com",
-            "Referer": "https://www.instagram.com/",
         }
-        self._bootstrap_cache = None
-        self._cookie_cache = None
-
-    def clear_bootstrap_cache(self):
-        self._bootstrap_cache = None
-        self._cookie_cache = None
 
     def _is_network_timeout(self, e: Exception) -> bool:
         """Check if an exception is a network timeout that should trigger retry."""
         error_msg = str(e).lower()
         return any(x in error_msg for x in ("timeout", "timed out", "connection", "curl: (28)"))
-
-    async def _bootstrap_session(self, session: AsyncSession) -> dict[str, str]:
-        """Harvest CSRF, LSD, and tracking cookies from Instagram's homepage."""
-        bootstrap = self._bootstrap_cache
-        cookies = self._cookie_cache
-        if bootstrap and cookies:
-            for k, v in cookies.items():
-                session.cookies.set(k, v)
-            return bootstrap
-
-        try:
-            response = await session.get("https://www.instagram.com/", timeout=15)
-        except Exception as e:
-            if self._is_network_timeout(e):
-                raise RateLimitError(f"Network timeout during bootstrap: {e}") from e
-            raise
-
-        if response.status_code in (401, 403, 429):
-            raise RateLimitError(f"Bootstrap HTTP {response.status_code}: IP restriction detected.")
-        if response.status_code >= 400:
-            raise ScraperError(f"Bootstrap HTTP {response.status_code}.")
-
-        csrf_token = session.cookies.get("csrftoken") or self._extract_csrf_token(response.text)
-        if not csrf_token:
-            raise RateLimitError("Bootstrap did not return a CSRF token; treating as a soft block.")
-
-        lsd_token = self._extract_lsd_token(response.text)
-        if not lsd_token:
-            raise RateLimitError("Bootstrap did not return an LSD token; treating as a soft block.")
-
-        self._bootstrap_cache = {"csrf_token": csrf_token, "lsd_token": lsd_token}
-        self._cookie_cache = {k: v for k, v in session.cookies.items()}
-        return self._bootstrap_cache
 
     @classmethod
     def _shortcode_to_media_id(cls, shortcode: str) -> str:
@@ -259,6 +231,21 @@ class InstagramGraphScraper:
         return media
 
     @classmethod
+    def _normalize_media_candidate(
+        cls,
+        raw: object,
+        expected_shortcode: str | None = None,
+    ) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        shortcode = raw.get("shortcode") or raw.get("code")
+        if not shortcode or (expected_shortcode is not None and shortcode != expected_shortcode):
+            return None
+        if not (cls._display_url(raw) or cls._video_url(raw) or cls._normalize_children(raw)):
+            return None
+        return cls._normalize_media_node(raw)
+
+    @classmethod
     def _unwrap_polaris_media(cls, data: dict) -> dict | None:
         media = data.get("xig_polaris_media") if isinstance(data, dict) else None
         if not isinstance(media, dict):
@@ -269,25 +256,39 @@ class InstagramGraphScraper:
         return media
 
     @classmethod
-    def _find_media_node(cls, obj) -> dict | None:
+    def _find_media_node(cls, obj, expected_shortcode: str | None = None) -> dict | None:
         """Recursively search a JSON tree for Instagram media nodes."""
         if isinstance(obj, dict):
             polaris = cls._unwrap_polaris_media(obj)
             if polaris is not None:
-                return cls._normalize_media_node(polaris)
+                normalized = cls._normalize_media_candidate(polaris, expected_shortcode)
+                if normalized is not None:
+                    return normalized
             if isinstance(obj.get("if_not_gated_logged_out"), dict):
-                return cls._normalize_media_node(obj["if_not_gated_logged_out"])
+                normalized = cls._normalize_media_candidate(
+                    obj["if_not_gated_logged_out"], expected_shortcode
+                )
+                if normalized is not None:
+                    return normalized
             if isinstance(obj.get("xdt_shortcode_media"), dict):
-                return cls._normalize_media_node(obj["xdt_shortcode_media"])
+                normalized = cls._normalize_media_candidate(
+                    obj["xdt_shortcode_media"], expected_shortcode
+                )
+                if normalized is not None:
+                    return normalized
             if isinstance(obj.get("shortcode_media"), dict):
-                return cls._normalize_media_node(obj["shortcode_media"])
+                normalized = cls._normalize_media_candidate(
+                    obj["shortcode_media"], expected_shortcode
+                )
+                if normalized is not None:
+                    return normalized
             for value in obj.values():
-                found = cls._find_media_node(value)
+                found = cls._find_media_node(value, expected_shortcode)
                 if found is not None:
                     return found
         elif isinstance(obj, list):
             for item in obj:
-                found = cls._find_media_node(item)
+                found = cls._find_media_node(item, expected_shortcode)
                 if found is not None:
                     return found
         return None
@@ -307,19 +308,171 @@ class InstagramGraphScraper:
             )
         return data
 
-    def _headers(self, bootstrap: dict[str, str], referer: str = "https://www.instagram.com/") -> dict[str, str]:
-        headers = self.base_headers.copy()
-        headers["Referer"] = referer
-        headers["x-csrftoken"] = bootstrap["csrf_token"]
-        return headers
+    @staticmethod
+    def _walk_dicts(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from InstagramGraphScraper._walk_dicts(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from InstagramGraphScraper._walk_dicts(child)
 
-    async def _extract_polaris_logged_out(
+    @staticmethod
+    def _application_json_documents(html: str) -> list[object]:
+        blocks = re.findall(
+            r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        documents: list[object] = []
+        for block in blocks:
+            try:
+                documents.append(json.loads(block))
+            except (json.JSONDecodeError, ValueError):
+                try:
+                    documents.append(json.loads(unescape(block)))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return documents
+
+    @classmethod
+    def _is_internal_not_found(cls, documents: list[object]) -> bool:
+        route_dicts = [item for document in documents for item in cls._walk_dicts(document)]
+        has_404_flag = any(item.get("show_lox_redesigned_404_page") is True for item in route_dicts)
+        has_error_page = any(item.get("pageID") == "httpErrorPage" for item in route_dicts)
+        has_error_root = any(
+            any(
+                isinstance(value, str) and "PolarisErrorRoot" in value
+                for value in item.values()
+            )
+            for item in route_dicts
+        )
+        return has_404_flag and has_error_page and has_error_root
+
+    @classmethod
+    def _restriction_details(cls, documents: list[object]) -> tuple[str | None, object] | None:
+        for document in documents:
+            for item in cls._walk_dicts(document):
+                reason = item.get("failure_reason")
+                age = item.get("restricted_age")
+                if "page_type" in item and (reason is not None or age is not None):
+                    return str(reason) if reason is not None else None, age
+        return None
+
+    @classmethod
+    def _discover_html_preloader(cls, documents: list[object]) -> dict | None:
+        matches: dict[str, dict] = {}
+        for document in documents:
+            for item in cls._walk_dicts(document):
+                if item.get("queryName") != cls.POLARIS_FRIENDLY_NAME:
+                    continue
+                doc_id = str(item.get("queryID", ""))
+                variables = item.get("variables")
+                if not doc_id.isdigit() or len(doc_id) < 12 or not isinstance(variables, dict):
+                    continue
+                matches[doc_id] = {
+                    "friendly_name": cls.POLARIS_FRIENDLY_NAME,
+                    "doc_id": doc_id,
+                    "variables": variables,
+                    "source": "html_preloader",
+                }
+        if len(matches) > 1:
+            raise ScraperError(
+                f"HTML exposed multiple current {cls.POLARIS_FRIENDLY_NAME} doc_ids: "
+                f"{sorted(matches)}"
+            )
+        return next(iter(matches.values()), None)
+
+    @classmethod
+    def _discover_operation_in_bundle_text(cls, text: str) -> str | None:
+        matches: set[str] = set()
+        for pattern in (cls.OPERATION_MODULE_RE, cls.DIRECT_OPERATION_RE):
+            for match in pattern.finditer(text):
+                if match.group("name") == cls.POLARIS_FRIENDLY_NAME:
+                    matches.add(match.group("doc_id"))
+        if len(matches) > 1:
+            raise ScraperError(
+                f"JS bundles exposed multiple current {cls.POLARIS_FRIENDLY_NAME} doc_ids: "
+                f"{sorted(matches)}"
+            )
+        return next(iter(matches), None)
+
+    @classmethod
+    def _bundle_urls(cls, html: str) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for raw_url in cls.SCRIPT_SRC_RE.findall(html):
+            url = urllib.parse.urljoin("https://www.instagram.com/", unescape(raw_url))
+            if urllib.parse.urlsplit(url).hostname != "static.cdninstagram.com" or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls[: cls.MAX_RELAY_BUNDLES]
+
+    async def _discover_bundle_operation(self, session: AsyncSession, html: str) -> dict | None:
+        headers = {**self.base_headers, "Accept": "*/*", "Referer": "https://www.instagram.com/"}
+        for url in self._bundle_urls(html):
+            try:
+                response = await session.get(url, headers=headers, timeout=15)
+            except Exception as e:
+                if self._is_network_timeout(e):
+                    continue
+                raise
+            if response.status_code != 200:
+                continue
+            text = response.text
+            if len(text.encode("utf-8")) > self.MAX_RELAY_BUNDLE_BYTES:
+                continue
+            doc_id = self._discover_operation_in_bundle_text(text)
+            if doc_id:
+                return {
+                    "friendly_name": self.POLARIS_FRIENDLY_NAME,
+                    "doc_id": doc_id,
+                    "source": url,
+                }
+        return None
+
+    def _navigation_headers(self) -> dict[str, str]:
+        return {
+            **self.base_headers,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    async def _fetch_post_page(self, session: AsyncSession, shortcode: str) -> str:
+        url = f"https://www.instagram.com/p/{shortcode}/"
+        try:
+            response = await session.get(url, headers=self._navigation_headers(), timeout=15)
+        except Exception as e:
+            if self._is_network_timeout(e):
+                raise RateLimitError(f"Network timeout during post-page fetch: {e}") from e
+            raise
+
+        if response.status_code in (401, 403, 429):
+            raise RateLimitError(f"Post page HTTP {response.status_code}: IP restriction detected.")
+        if response.status_code == 404:
+            raise MediaNotFoundError(f"Instagram post {shortcode} was not found.")
+        if response.status_code >= 400:
+            raise ScraperError(f"Post page HTTP {response.status_code}.")
+        return response.text
+
+    async def _execute_relay_operation(
         self,
         session: AsyncSession,
         shortcode: str,
-        bootstrap: dict[str, str],
+        operation: dict,
+        page_html: str,
     ) -> dict | None:
-        media_id = self._shortcode_to_media_id(shortcode)
+        variables = operation.get("variables")
+        if not isinstance(variables, dict):
+            variables = {"media_id": self._shortcode_to_media_id(shortcode)}
         payload = {
             "av": "0",
             "__d": "www",
@@ -328,15 +481,28 @@ class InstagramGraphScraper:
             "__req": "1",
             "__comet_req": "7",
             "fb_api_caller_class": "RelayModern",
-            "fb_api_req_friendly_name": self.POLARIS_FRIENDLY_NAME,
-            "variables": json.dumps({"media_id": media_id}, separators=(",", ":")),
+            "fb_api_req_friendly_name": operation["friendly_name"],
+            "variables": json.dumps(variables, separators=(",", ":")),
             "server_timestamps": "true",
-            "doc_id": self.POLARIS_LOGGED_OUT_DOC_ID,
+            "doc_id": operation["doc_id"],
         }
-        headers = self._headers(bootstrap, f"https://www.instagram.com/p/{shortcode}/")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        headers["x-fb-friendly-name"] = self.POLARIS_FRIENDLY_NAME
-        headers["x-fb-lsd"] = bootstrap["lsd_token"]
+        headers = {
+            **self.base_headers,
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.instagram.com",
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+            "x-fb-friendly-name": operation["friendly_name"],
+        }
+        lsd_token = self._extract_lsd_token(page_html)
+        if lsd_token:
+            payload["lsd"] = lsd_token
+            headers["x-fb-lsd"] = lsd_token
+        cookies = getattr(session, "cookies", None)
+        csrf_token = cookies.get("csrftoken") if cookies is not None else None
+        csrf_token = csrf_token or self._extract_csrf_token(page_html)
+        if csrf_token:
+            headers["x-csrftoken"] = csrf_token
 
         try:
             response = await session.post(
@@ -347,112 +513,72 @@ class InstagramGraphScraper:
             )
         except Exception as e:
             if self._is_network_timeout(e):
-                raise RateLimitError(f"Network timeout during logged-out GraphQL: {e}") from e
+                raise RateLimitError(f"Network timeout during current Relay query: {e}") from e
             raise
 
-        data = await self._read_json_response(response, "Logged-out GraphQL")
-        media = self._find_media_node(data.get("data") or data)
+        data = await self._read_json_response(response, "Current Relay query")
+        media = self._find_media_node(data.get("data") or data, shortcode)
         if media is not None:
-            logger.info("Extracted media via logged-out GraphQL for %s", shortcode)
-            return media
-
-        raw_preview = json.dumps(data, ensure_ascii=False)[:500]
-        logger.warning("Logged-out GraphQL returned no public media for %s: %s", shortcode, raw_preview)
-        return None
-
-    async def _extract_legacy_shortcode(
-        self,
-        session: AsyncSession,
-        shortcode: str,
-        bootstrap: dict[str, str],
-    ) -> dict | None:
-        payload = {
-            "variables": json.dumps({"shortcode": shortcode}, separators=(",", ":")),
-            "doc_id": self.LEGACY_SHORTCODE_DOC_ID,
-            "server_timestamps": "true",
-        }
-        headers = self._headers(bootstrap)
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-        try:
-            response = await session.post(
-                "https://www.instagram.com/graphql/query",
-                headers=headers,
-                data=urllib.parse.urlencode(payload),
-                timeout=15,
+            logger.info(
+                "Extracted media via discovered Relay operation %s for %s",
+                operation["doc_id"],
+                shortcode,
             )
-        except Exception as e:
-            if self._is_network_timeout(e):
-                raise RateLimitError(f"Network timeout during legacy GraphQL: {e}") from e
-            raise
-
-        data = await self._read_json_response(response, "Legacy GraphQL")
-        media = self._find_media_node(data.get("data") or data)
-        if media is not None:
-            logger.info("Extracted media via legacy GraphQL for %s", shortcode)
             return media
-
         raw_preview = json.dumps(data, ensure_ascii=False)[:500]
-        logger.warning("Legacy GraphQL returned no media for %s: %s", shortcode, raw_preview)
+        logger.warning("Current Relay query returned no public media for %s: %s", shortcode, raw_preview)
         return None
-
-    async def _extract_from_html(self, session: AsyncSession, shortcode: str) -> dict:
-        """Fallback: fetch the post page and extract embedded JSON media node."""
-        url = f"https://www.instagram.com/p/{shortcode}/"
-        logger.info("GraphQL returned no media; trying HTML fallback for %s", shortcode)
-        try:
-            response = await session.get(url, timeout=15)
-        except Exception as e:
-            if self._is_network_timeout(e):
-                raise RateLimitError(f"Network timeout during HTML fetch: {e}") from e
-            raise
-
-        if response.status_code in (401, 403, 429):
-            raise RateLimitError(f"HTML fetch HTTP {response.status_code}: IP restriction detected.")
-        if response.status_code == 404:
-            raise MediaNotFoundError(f"Instagram post {shortcode} was not found.")
-        if response.status_code >= 400:
-            raise ScraperError(f"HTML fetch HTTP {response.status_code}.")
-
-        blocks = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', response.text, re.DOTALL)
-        for block in blocks:
-            try:
-                data = json.loads(block)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            media = self._find_media_node(data)
-            if media is not None:
-                logger.info("Extracted media from embedded HTML JSON for %s", shortcode)
-                return media
-
-        raise RestrictedMediaError(
-            f"Instagram post {shortcode} is not accessible anonymously."
-        )
 
     async def extract_media(self, shortcode: str) -> dict:
-        """Query Instagram public media using anonymous web endpoints."""
-        async with AsyncSession(impersonate="chrome124") as session:
-            bootstrap = await self._bootstrap_session(session)
+        """Extract public media from Instagram's current anonymous web client."""
+        async with self._session_factory(impersonate="chrome124") as session:
+            page_html = await self._fetch_post_page(session, shortcode)
+            documents = self._application_json_documents(page_html)
 
-            try:
-                logged_out = await self._extract_polaris_logged_out(session, shortcode, bootstrap)
-                if logged_out is not None:
-                    return logged_out
-            except RateLimitError:
-                raise
-            except ScraperError as e:
-                logger.warning("Logged-out GraphQL failed for %s: %s", shortcode, e)
+            if self._is_internal_not_found(documents):
+                raise MediaNotFoundError(f"Instagram post {shortcode} was not found.")
 
-            try:
-                legacy = await self._extract_legacy_shortcode(session, shortcode, bootstrap)
-                if legacy is not None:
-                    return legacy
-            except RateLimitError:
-                raise
-            except ScraperError as e:
-                logger.warning("Legacy GraphQL failed for %s: %s", shortcode, e)
+            restriction = self._restriction_details(documents)
+            if restriction is not None:
+                reason, age = restriction
+                details = ", ".join(
+                    part
+                    for part in (
+                        f"reason={reason}" if reason else "",
+                        f"age={age}" if age is not None else "",
+                    )
+                    if part
+                )
+                raise RestrictedMediaError(
+                    f"Instagram explicitly restricted post {shortcode}"
+                    + (f" ({details})." if details else ".")
+                )
 
-            return await self._extract_from_html(session, shortcode)
+            for document in documents:
+                media = self._find_media_node(document, shortcode)
+                if media is not None:
+                    logger.info("Extracted media from the initial HTML for %s", shortcode)
+                    return media
+
+            operation = self._discover_html_preloader(documents)
+            if operation is not None:
+                expected_media_id = self._shortcode_to_media_id(shortcode)
+                observed_media_id = str(operation["variables"].get("media_id", ""))
+                if observed_media_id != expected_media_id:
+                    raise ScraperError(
+                        f"HTML preloader media_id mismatch for {shortcode}: "
+                        f"expected {expected_media_id}, got {observed_media_id or 'missing'}"
+                    )
+            if operation is None:
+                operation = await self._discover_bundle_operation(session, page_html)
+            if operation is not None:
+                media = await self._execute_relay_operation(session, shortcode, operation, page_html)
+                if media is not None:
+                    return media
+
+            raise AnonymousMediaUnavailableError(
+                f"Instagram returned no anonymous media or decisive route reason for {shortcode}."
+            )
 
     def parse_response(self, raw_data: dict) -> dict:
         """Transform normalized GraphQL response into a plain dict."""
