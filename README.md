@@ -1,15 +1,17 @@
 # Pinchana Instagram
 
-This FastAPI module extracts public Instagram posts, Reels, and compatible video posts through an HTTP GraphQL workflow. It downloads images, videos, and ordered carousels into the shared Pinchana cache.
+This FastAPI module extracts public Instagram posts and Reels through Instagram's anonymous first-party web surfaces. It downloads images, videos, and ordered carousels into the shared Pinchana cache.
 
 ## Processing flow
 
 1. Validate and normalize the submitted Instagram URL.
-2. Extract post data through Instagram GraphQL using the configured HTTP impersonation.
-3. Rotate the Gluetun connection and retry within the bounded policy after relevant `403` or `429` responses.
-4. Download media and store it under `/app/cache/instagram/{shortcode}` in containers.
+2. Fetch the canonical post document with browser-compatible navigation headers and extract its embedded Relay media payload.
+3. If the initial document has no media, discover the current persisted operation from `expectedPreloaders`; scan referenced Relay bundles only when that metadata is absent.
+4. Classify Instagram's HTTP-200 internal 404 and explicit route restrictions before treating an empty anonymous surface as ambiguous.
+5. Rotate the Gluetun connection and retry within the bounded policy only after request-level `401`, `403`, `429`, or timeout evidence.
+6. Download media and store it under `/app/cache/instagram/{shortcode}` in containers.
 
-Private, deleted, login-only, region-restricted, or changed posts can return a structured rejection even when the service is healthy.
+Deleted posts return `not_found`; explicit route gates return `restricted_media`; anonymous misses without decisive evidence return `anonymous_unavailable`. The latter deliberately does not guess whether a post is private, login-only, expired, or otherwise unavailable.
 
 ## API
 
