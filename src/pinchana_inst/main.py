@@ -96,16 +96,20 @@ def extract_shortcode(url: str) -> str:
 
 
 def _is_explicit_age_gate(error: RestrictedMediaError) -> bool:
-    """Only spend a SocialCrawl credit for Instagram's explicit post age gate.
+    """Only spend a SocialCrawl credit for Instagram's exact post age gate.
 
     The anonymous page route represented by the restricted HAR/fixture exposes
-    `failure_reason=MA` and `restricted_age=<n>`. Other restriction classes must
-    keep their existing 403 behavior instead of falling through to paid lookup.
+    both `failure_reason=MA` and `restricted_age=<n>`. Requiring both signals
+    prevents unrelated restriction classes from falling through to paid lookup.
     """
     message = str(error)
-    return bool(re.search(r"(?:^|[\s(,])reason=MA(?:[,.)\s]|$)", message)) or bool(
+    has_minimum_age_reason = bool(
+        re.search(r"(?:^|[\s(,])reason=MA(?:[,.)\s]|$)", message)
+    )
+    has_restricted_age = bool(
         re.search(r"(?:^|[\s(,])age=\d+(?:[,.)\s]|$)", message)
     )
+    return has_minimum_age_reason and has_restricted_age
 
 
 async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeResponse:
