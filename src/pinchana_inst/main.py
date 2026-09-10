@@ -20,18 +20,21 @@ from .scraper import (
     RestrictedMediaError,
     ScraperError,
 )
+from .socialcrawl import SocialCrawlDisabledError, SocialCrawlError, SocialCrawlResolver
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 scraper = InstagramGraphScraper()
+socialcrawl = SocialCrawlResolver()
 gluetun = GluetunController()
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
 INSTAGRAM_CACHE_VERSION = 2
+_AGE_RESTRICTION_RE = re.compile(r"(?:^|[\s,(])age=\d+(?:[\s,).]|$)")
 
 
 def _media_url_to_path(url: str | None):
@@ -80,6 +83,11 @@ def _cached_media_ready(metadata: dict) -> bool:
             return False
 
     return True
+
+
+def _is_explicit_age_restriction(error: RestrictedMediaError) -> bool:
+    """Only allow the paid fallback for Instagram's explicit restricted_age signal."""
+    return bool(_AGE_RESTRICTION_RE.search(str(error)))
 
 
 def extract_shortcode(url: str) -> str:
@@ -240,6 +248,27 @@ async def _process_scrape_request(request: ScrapeRequest):
             ) from e
         except RestrictedMediaError as e:
             logger.info("Instagram post %s is not accessible anonymously: %s", shortcode, e)
+            if _is_explicit_age_restriction(e):
+                try:
+                    raw = await socialcrawl.resolve(str(request.url), shortcode)
+                except SocialCrawlDisabledError:
+                    logger.info("SocialCrawl age-restricted fallback is not configured")
+                except SocialCrawlError as fallback_error:
+                    logger.warning(
+                        "SocialCrawl fallback failed for Instagram post %s: %s",
+                        shortcode,
+                        fallback_error,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "code": "restricted_fallback_failed",
+                            "message": "Instagram restricted-media fallback failed",
+                        },
+                    ) from fallback_error
+                else:
+                    return await _download_and_build_response(shortcode, raw)
+
             raise HTTPException(
                 status_code=403,
                 detail={
