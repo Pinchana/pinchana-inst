@@ -27,6 +27,7 @@ class SocialCrawlResolver:
 
     ENDPOINT = "https://www.socialcrawl.dev/v1/instagram/post"
     DEFAULT_TIMEOUT_SECONDS = 20.0
+    ALLOWED_MEDIA_HOST_SUFFIXES = (".cdninstagram.com", ".fbcdn.net")
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None):
         self._transport = transport
@@ -48,6 +49,14 @@ class SocialCrawlResolver:
             return SocialCrawlResolver.DEFAULT_TIMEOUT_SECONDS
         return value if value > 0 else SocialCrawlResolver.DEFAULT_TIMEOUT_SECONDS
 
+    @classmethod
+    def _is_allowed_media_url(cls, url: str) -> bool:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            return False
+        hostname = parsed.hostname.lower().rstrip(".")
+        return any(hostname.endswith(suffix) for suffix in cls.ALLOWED_MEDIA_HOST_SUFFIXES)
+
     @staticmethod
     def _is_video_url(url: str) -> bool:
         parsed = urlsplit(url)
@@ -61,6 +70,9 @@ class SocialCrawlResolver:
 
     @classmethod
     def _normalise_media(cls, payload: dict, shortcode: str) -> dict:
+        if payload.get("platform") != "instagram":
+            raise SocialCrawlError("SocialCrawl returned an unexpected platform")
+
         data = payload.get("data")
         post = data.get("post") if isinstance(data, dict) else None
         content = post.get("content") if isinstance(post, dict) else None
@@ -76,16 +88,25 @@ class SocialCrawlResolver:
         if not isinstance(raw_urls, list):
             raise SocialCrawlError("SocialCrawl response is missing media_urls")
 
-        media_urls = [
-            item.strip()
-            for item in raw_urls
-            if isinstance(item, str) and item.strip().startswith(("https://", "http://"))
-        ]
+        media_urls: list[str] = []
+        for item in raw_urls:
+            if not isinstance(item, str):
+                continue
+            url = item.strip()
+            if not url:
+                continue
+            if not cls._is_allowed_media_url(url):
+                raise SocialCrawlError("SocialCrawl returned a non-Instagram media URL")
+            media_urls.append(url)
         if not media_urls:
             raise SocialCrawlError("SocialCrawl returned no usable media URLs")
 
         thumbnail_url = content.get("thumbnail_url")
-        if not isinstance(thumbnail_url, str) or not thumbnail_url.startswith(("https://", "http://")):
+        if isinstance(thumbnail_url, str):
+            thumbnail_url = thumbnail_url.strip()
+            if thumbnail_url and not cls._is_allowed_media_url(thumbnail_url):
+                raise SocialCrawlError("SocialCrawl returned a non-Instagram thumbnail URL")
+        if not isinstance(thumbnail_url, str) or not thumbnail_url:
             thumbnail_url = None
 
         content_type = ""
