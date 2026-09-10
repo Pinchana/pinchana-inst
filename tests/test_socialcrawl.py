@@ -49,7 +49,7 @@ async def test_socialcrawl_requires_api_key(monkeypatch):
 async def test_socialcrawl_normalises_carousel(monkeypatch):
     monkeypatch.setenv("SOCIALCRAWL_API_KEY", "test-key")
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["x-api-key"] == "test-key"
         assert request.url.params["url"] == "https://www.instagram.com/p/AGE123/"
         return httpx.Response(
@@ -75,7 +75,7 @@ async def test_socialcrawl_normalises_carousel(monkeypatch):
 async def test_socialcrawl_normalises_video(monkeypatch):
     monkeypatch.setenv("SOCIALCRAWL_API_KEY", "test-key")
 
-    async def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json=socialcrawl_payload(
@@ -109,7 +109,7 @@ async def test_socialcrawl_normalises_video(monkeypatch):
 async def test_socialcrawl_rejects_failed_responses(monkeypatch, response):
     monkeypatch.setenv("SOCIALCRAWL_API_KEY", "test-key")
 
-    async def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return response
 
     resolver = SocialCrawlResolver(transport=httpx.MockTransport(handler))
