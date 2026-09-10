@@ -147,11 +147,14 @@ async def test_socialcrawl_timeout_is_not_retried(monkeypatch):
     assert len(calls) == 1
 
 
-def test_paid_fallback_classifier_only_accepts_explicit_age_gate():
+def test_paid_fallback_classifier_only_accepts_exact_age_gate():
     assert main._is_explicit_age_gate(
         RestrictedMediaError("Instagram explicitly restricted post ABC (reason=MA, age=16).")
     )
-    assert main._is_explicit_age_gate(
+    assert not main._is_explicit_age_gate(
+        RestrictedMediaError("Instagram explicitly restricted post ABC (reason=MA).")
+    )
+    assert not main._is_explicit_age_gate(
         RestrictedMediaError("Instagram explicitly restricted post ABC (age=18).")
     )
     assert not main._is_explicit_age_gate(RestrictedMediaError("private or login required"))
