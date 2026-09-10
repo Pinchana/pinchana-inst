@@ -12,9 +12,9 @@ from pinchana_core.plugins import ScraperPlugin, registry
 from pinchana_core.storage import MediaStorage
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
+from .age_gate import AgeGateAwareInstagramGraphScraper
 from .scraper import (
     AnonymousMediaUnavailableError,
-    InstagramGraphScraper,
     MediaNotFoundError,
     RateLimitError,
     RestrictedMediaError,
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-scraper = InstagramGraphScraper()
+scraper = AgeGateAwareInstagramGraphScraper()
 socialcrawl = SocialCrawlResolver()
 gluetun = GluetunController()
 storage = MediaStorage(
@@ -86,8 +86,11 @@ def _cached_media_ready(metadata: dict) -> bool:
 
 
 def _is_explicit_age_restriction(error: RestrictedMediaError) -> bool:
-    """Only allow the paid fallback for Instagram's explicit restricted_age signal."""
-    return bool(_AGE_RESTRICTION_RE.search(str(error)))
+    """Only allow the paid fallback for explicit first-party age-gate signals."""
+    return bool(
+        getattr(error, "age_restricted", False)
+        or _AGE_RESTRICTION_RE.search(str(error))
+    )
 
 
 def extract_shortcode(url: str) -> str:
