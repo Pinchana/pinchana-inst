@@ -55,8 +55,8 @@ async def test_socialcrawl_normalises_carousel(monkeypatch):
         return httpx.Response(
             200,
             json=socialcrawl_payload([
-                "https://cdn.example/one.jpg?sig=1",
-                "https://cdn.example/two.jpg?sig=2",
+                "https://scontent-a.cdninstagram.com/one.jpg?sig=1",
+                "https://instagram.test.fbcdn.net/two.jpg?sig=2",
             ]),
         )
 
@@ -68,7 +68,9 @@ async def test_socialcrawl_normalises_carousel(monkeypatch):
     assert raw["author"] == "author"
     assert raw["primary_media"]["media_type"] == "GraphSidecar"
     assert len(raw["carousel_children"]) == 2
-    assert raw["carousel_children"][0]["display_url"].startswith("https://cdn.example/one.jpg")
+    assert raw["carousel_children"][0]["display_url"].startswith(
+        "https://scontent-a.cdninstagram.com/one.jpg"
+    )
 
 
 @pytest.mark.asyncio
@@ -79,8 +81,8 @@ async def test_socialcrawl_normalises_video(monkeypatch):
         return httpx.Response(
             200,
             json=socialcrawl_payload(
-                ["https://cdn.example/video.mp4?sig=1"],
-                thumbnail_url="https://cdn.example/thumb.jpg?sig=2",
+                ["https://scontent-a.cdninstagram.com/video.mp4?sig=1"],
+                thumbnail_url="https://instagram.test.fbcdn.net/thumb.jpg?sig=2",
                 duration_seconds=12.5,
             ),
         )
@@ -90,8 +92,8 @@ async def test_socialcrawl_normalises_video(monkeypatch):
 
     assert raw["primary_media"] == {
         "media_type": "GraphVideo",
-        "display_url": "https://cdn.example/thumb.jpg?sig=2",
-        "video_url": "https://cdn.example/video.mp4?sig=1",
+        "display_url": "https://instagram.test.fbcdn.net/thumb.jpg?sig=2",
+        "video_url": "https://scontent-a.cdninstagram.com/video.mp4?sig=1",
     }
     assert raw["carousel_children"] is None
 
@@ -104,6 +106,9 @@ async def test_socialcrawl_normalises_video(monkeypatch):
         httpx.Response(200, json={"success": False}),
         httpx.Response(200, json=socialcrawl_payload([])),
         httpx.Response(200, content=b"not-json"),
+        httpx.Response(200, json={**socialcrawl_payload([
+            "https://example.com/not-instagram.jpg"
+        ])}),
     ],
 )
 async def test_socialcrawl_rejects_failed_responses(monkeypatch, response):
@@ -140,7 +145,7 @@ async def test_exact_age_restriction_uses_socialcrawl_once(monkeypatch):
             "author": "author",
             "primary_media": {
                 "media_type": "GraphImage",
-                "display_url": "https://cdn.example/image.jpg",
+                "display_url": "https://scontent-a.cdninstagram.com/image.jpg",
                 "video_url": None,
             },
             "carousel_children": None,
