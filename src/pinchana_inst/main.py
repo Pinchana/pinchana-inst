@@ -20,12 +20,18 @@ from .scraper import (
     RestrictedMediaError,
     ScraperError,
 )
+from .socialcrawl import (
+    SocialCrawlError,
+    SocialCrawlNotConfiguredError,
+    SocialCrawlResolver,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 scraper = InstagramGraphScraper()
+socialcrawl = SocialCrawlResolver()
 gluetun = GluetunController()
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
@@ -87,6 +93,23 @@ def extract_shortcode(url: str) -> str:
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Instagram URL format.")
     return match.group(1)
+
+
+def _is_explicit_age_gate(error: RestrictedMediaError) -> bool:
+    """Only spend a SocialCrawl credit for Instagram's exact post age gate.
+
+    The anonymous page route represented by the restricted HAR/fixture exposes
+    both `failure_reason=MA` and `restricted_age=<n>`. Requiring both signals
+    prevents unrelated restriction classes from falling through to paid lookup.
+    """
+    message = str(error)
+    has_minimum_age_reason = bool(
+        re.search(r"(?:^|[\s(,])reason=MA(?:[,.)\s]|$)", message)
+    )
+    has_restricted_age = bool(
+        re.search(r"(?:^|[\s(,])age=\d+(?:[,.)\s]|$)", message)
+    )
+    return has_minimum_age_reason and has_restricted_age
 
 
 async def _download_and_build_response(shortcode: str, raw: dict) -> ScrapeResponse:
@@ -240,13 +263,37 @@ async def _process_scrape_request(request: ScrapeRequest):
             ) from e
         except RestrictedMediaError as e:
             logger.info("Instagram post %s is not accessible anonymously: %s", shortcode, e)
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "restricted_media",
-                    "message": "This Instagram post is not accessible anonymously",
-                },
-            ) from e
+            if not _is_explicit_age_gate(e):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "restricted_media",
+                        "message": "This Instagram post is not accessible anonymously",
+                    },
+                ) from e
+
+            logger.info("Using SocialCrawl for explicit age-gated Instagram post %s", shortcode)
+            try:
+                raw = await socialcrawl.resolve(str(request.url), shortcode)
+            except SocialCrawlNotConfiguredError as resolver_error:
+                logger.warning("SocialCrawl fallback is not configured for %s", shortcode)
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "restricted_resolver_unavailable",
+                        "message": "Restricted Instagram media resolver is not configured",
+                    },
+                ) from resolver_error
+            except SocialCrawlError as resolver_error:
+                logger.warning("SocialCrawl fallback failed for %s: %s", shortcode, resolver_error)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "restricted_resolver_failed",
+                        "message": "Restricted Instagram media resolver failed",
+                    },
+                ) from resolver_error
+            return await _download_and_build_response(shortcode, raw)
         except AnonymousMediaUnavailableError as e:
             logger.info("Instagram post %s is unavailable anonymously: %s", shortcode, e)
             raise HTTPException(
