@@ -87,7 +87,7 @@ def scraper():
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(main.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main.storage, "_base_path", tmp_path)
     return TestClient(main.app)
 
 
@@ -136,7 +136,7 @@ async def test_rejects_media_path_traversal():
 
 
 def test_cache_requires_current_version_and_nonempty_media(tmp_path, monkeypatch):
-    monkeypatch.setattr(main.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main.storage, "_base_path", tmp_path)
     metadata = {
         "_cache_version": main.INSTAGRAM_CACHE_VERSION,
         "thumbnail_url": "/media/instagram/IMG123/thumbnail.jpg",
@@ -180,7 +180,7 @@ async def test_required_download_failure_is_not_cached_and_keeps_retryable_code(
     async def failed_download(_url, _destination):
         return False
 
-    monkeypatch.setattr(main.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main.storage, "download", failed_download)
     monkeypatch.setattr(main.scraper, "extract_media", fake_extract_media)
 
@@ -212,7 +212,7 @@ async def test_successful_download_writes_current_cache_version(tmp_path, monkey
         destination.write_bytes(b"image")
         return True
 
-    monkeypatch.setattr(main.storage, "base_path", tmp_path)
+    monkeypatch.setattr(main.storage, "_base_path", tmp_path)
     monkeypatch.setattr(main.storage, "download", successful_download)
 
     response = await main._download_and_build_response("IMG123", raw)
